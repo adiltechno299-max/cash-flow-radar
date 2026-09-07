@@ -248,8 +248,8 @@ with st.expander("⚙️ إعدادات الرادار الثلاثي", expanded
     
     c1, c2 = st.columns(2)
     with c1:
-        score_min = st.slider("🎯 حساسـية الإشارة (Score Limit)", 0.20, 0.60, 0.35, 0.05, help="خفض الرقم يتيح ظهور الفرص بشكل أسرع وأسهل.")
-        max_stocks = st.selectbox("📊 عدد الأسهم للمسح", [50, 100, 200, 500], index=1)
+        score_min = st.slider("🎯 حساسـية الإشارة (Score Limit)", 0.20, 0.90, 0.35, 0.05, help="خفض الرقم يتيح ظهور الفرص بشكل أسرع وأسهل. رفعه يشدد الفلترة على أقوى الإشارات فقط.")
+        max_stocks = st.selectbox("📊 عدد الأسهم للمسح", [50, 100, 200, 500, 1000, 2000, 3000, 5000], index=1)
     with c2:
         min_price = st.number_input("💵 الحد الأدنى للسعر ($)", value=5.0, step=1.0)
         min_vol_avg = st.number_input("💧 أدنى سيولة متوسطة", value=5000, step=1000)
@@ -260,6 +260,8 @@ custom_tickers = [x.strip().upper() for x in re.split(r'[,\s]+', search_input) i
 scan_list = list(dict.fromkeys(custom_tickers + nasdaq_all[:max_stocks]))
 
 st.info(f"سيتم فحص **{len(scan_list)}** سهم على فريم **{tf}**.")
+if max_stocks >= 1000:
+    st.caption("⚠️ مسح عدد كبير من الأسهم قد يستغرق وقتاً أطول بسبب حدود طلبات Yahoo Finance.")
 
 if st.button("🔍 SCAN MARKET NOW", type="primary", use_container_width=True):
     start_time = time.time()
@@ -319,5 +321,3 @@ if st.button("🔍 SCAN MARKET NOW", type="primary", use_container_width=True):
         
     if not results:
         st.warning("لم يتم اكتشاف أي فرص تتطابق مع معايير التدفق النقدي الحالية. جرّب خفض (Score Limit).")
-
-st.caption("⚠️ **تنويه:** الرادار مصمم لاكتشاف مراكز التدفق النقدي المؤسساتي والسيولة الحية بناءً على عزم الأوامر Volume-Weighted.")

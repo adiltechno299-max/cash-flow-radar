@@ -69,27 +69,52 @@ TF_CONFIG = {
 # ═══════════════════════════════════════════════
 #  DATA DOWNLOAD (BATCH)
 # ═══════════════════════════════════════════════
-def download_raw_batch(tickers: tuple, yf_interval: str, yf_period: str) -> dict:
-    tickers = list(tickers)
-    result = {}
-    chunks = [tickers[i:i + CHUNK_SIZE] for i in range(0, len(tickers), CHUNK_SIZE)]
+MAX_RETRIES        = 4     # أقصى عدد محاولات إعادة عند فشل الشبكة
+BACKOFF_BASE        = 1.5  # ثانية (أساس التصاعد الأسي)
+BACKOFF_MAX_SLEEP   = 20.0 # سقف زمن الانتظار بين المحاولات
 
-    for chunk in chunks:
+def _download_chunk_with_backoff(chunk, yf_interval, yf_period, status_cb=None):
+    """
+    يحاول تحميل حزمة أسهم مع تأخير تصاعدي (exponential backoff + jitter)
+    عند حدوث أخطاء شبكة أو تقييد معدل الطلبات (rate limiting) من Yahoo Finance.
+    """
+    attempt = 0
+    while True:
         try:
             raw = yf.download(
                 tickers=chunk, period=yf_period, interval=yf_interval,
                 group_by="ticker", threads=True, progress=False, auto_adjust=True
             )
-            if not raw.empty:
-                for ticker in chunk:
-                    try:
-                        df = raw[ticker].copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
-                        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-                        result[ticker] = df if len(df) > 35 else None
-                    except:
-                        result[ticker] = None
-        except:
-            pass
+            return raw
+        except Exception as e:
+            attempt += 1
+            if attempt > MAX_RETRIES:
+                # استنفدنا المحاولات: نتخلى عن هذه الحزمة ونكمل الفحص بدلاً من إيقاف البرنامج بالكامل
+                if status_cb:
+                    status_cb(f"⚠️ تعذر تحميل حزمة بعد {MAX_RETRIES} محاولات، سيتم تجاوزها.")
+                return None
+            # تصاعد أسي: 1.5^attempt مع سقف أقصى + عشوائية بسيطة (jitter) لتفادي تصادم الطلبات
+            sleep_time = min(BACKOFF_BASE ** attempt, BACKOFF_MAX_SLEEP)
+            sleep_time += np.random.uniform(0, 0.5)
+            if status_cb:
+                status_cb(f"🌐 خطأ شبكة/تقييد معدل الطلبات، إعادة المحاولة {attempt}/{MAX_RETRIES} بعد {sleep_time:.1f}ث...")
+            time.sleep(sleep_time)
+
+def download_raw_batch(tickers: tuple, yf_interval: str, yf_period: str, status_cb=None) -> dict:
+    tickers = list(tickers)
+    result = {}
+    chunks = [tickers[i:i + CHUNK_SIZE] for i in range(0, len(tickers), CHUNK_SIZE)]
+
+    for chunk in chunks:
+        raw = _download_chunk_with_backoff(chunk, yf_interval, yf_period, status_cb)
+        if raw is not None and not raw.empty:
+            for ticker in chunk:
+                try:
+                    df = raw[ticker].copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
+                    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                    result[ticker] = df if len(df) > 35 else None
+                except:
+                    result[ticker] = None
         time.sleep(0.2)
     return result
 
@@ -249,7 +274,7 @@ with st.expander("⚙️ إعدادات الرادار الثلاثي", expanded
     c1, c2 = st.columns(2)
     with c1:
         score_min = st.slider("🎯 حساسـية الإشارة (Score Limit)", 0.20, 0.90, 0.35, 0.05, help="خفض الرقم يتيح ظهور الفرص بشكل أسرع وأسهل. رفعه يشدد الفلترة على أقوى الإشارات فقط.")
-        max_stocks = st.selectbox("📊 عدد الأسهم للمسح", [50, 100, 200, 500, 1000, 2000, 3000, 5000], index=1)
+        max_stocks = st.selectbox("📊 عدد الأسهم للمسح", [50, 100, 200, 500, 1000, 2000, 3000, 4000], index=1)
     with c2:
         min_price = st.number_input("💵 الحد الأدنى للسعر ($)", value=5.0, step=1.0)
         min_vol_avg = st.number_input("💧 أدنى سيولة متوسطة", value=5000, step=1000)
@@ -276,7 +301,10 @@ if st.button("🔍 SCAN MARKET NOW", type="primary", use_container_width=True):
         status_text.text(f"📡 فحص تدفق السيولة والزخم... الحزمة {idx+1}/{len(chunks)}")
         
         cfg = TF_CONFIG[tf]
-        raw_data = download_raw_batch(tuple(chunk), cfg["yf_interval"], cfg["yf_period"])
+        raw_data = download_raw_batch(
+            tuple(chunk), cfg["yf_interval"], cfg["yf_period"],
+            status_cb=lambda msg: status_text.text(msg)
+        )
         
         for ticker, df in raw_data.items():
             sig = get_radar_signal(ticker, df, score_min, min_price, min_vol_avg)

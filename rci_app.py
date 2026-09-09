@@ -1,8 +1,7 @@
 """
-🕯️ Candle Anatomy Radar 1.0 — Streamlit Web App
-رادار تشريح الشموع (متوافق مع الهواتف)
---- تحويل بيانات OHLCV الخام إلى مقاييس موحّدة (Normalized) بحيث تصبح
-    شمعة 5 دقائق قابلة للمقارنة المباشرة مع شمعة يومية ---
+🕯️ Candle Radar 1.0 — Streamlit Web App
+رادار الشموع الموحّدة (متوافق مع الهواتف)
+--- تحويل بيانات OHLCV الخام إلى مقاييس Normalized بحيث تقارَن شمعة 5 دقائق بشمعة يومية ---
 --- نسخة: فرص الشراء (BUY) فقط، تم تجاهل إشارات البيع (SELL) ---
 --- فلتر القيمة السوقية: تجاهل الشركات الصغيرة (أقل من الحد المحدد) ---
 """
@@ -35,7 +34,7 @@ BODY_FULL      = 0.55   # جسم يشكّل 55% من المدى = حسم كام�
 WICK_FULL      = 0.35   # فرق فتائل 35% من المدى = ضغط كامل باتجاه واحد
 
 # ── Candle Radar 1.0 — أوزان النموذج المرجّح ──
-# عند تفعيل فلتر الاتجاه: يُعاد توزيع الوزن (الاتجاه = 10% ناعمة، لا رفض).
+# عند تفعيل فلتر الاتجاه: يُعاد توزيع الوزن (الاتجاه = 10% ناعمة، لا رفض لأي إشارة).
 WEIGHT_CANDLE             = 0.40   # ثابت دائماً: تشريح الشمعة 40%
 WEIGHT_VOLUME_WITH_TREND  = 0.30   # الحجم/النشاط عند تفعيل فلتر الاتجاه
 WEIGHT_CONTEXT_WITH_TREND = 0.20   # السياق عند تفعيل فلتر الاتجاه
@@ -44,9 +43,9 @@ WEIGHT_VOLUME_NO_TREND    = 0.35   # الحجم/النشاط عند تعطيل �
 WEIGHT_CONTEXT_NO_TREND   = 0.25   # السياق عند تعطيل فلتر الاتجاه
 
 # أوزان داخلية للركائز
-AN_W_CLOSE, AN_W_BODY, AN_W_WICK           = 0.50, 0.30, 0.20  # تشريح الشمعة
-AC_W_RVOL, AC_W_DIR, AC_W_RANGE            = 0.55, 0.25, 0.20  # الحجم/النشاط
-CX_W_SUSTAIN, CX_W_RANGEPOS, CX_W_ROOM     = 0.40, 0.30, 0.30  # السياق
+AN_W_CLOSE, AN_W_BODY, AN_W_WICK       = 0.50, 0.30, 0.20  # تشريح الشمعة
+AC_W_RVOL, AC_W_DIR, AC_W_RANGE        = 0.55, 0.25, 0.20  # الحجم/النشاط
+CX_W_SUSTAIN, CX_W_RANGEPOS, CX_W_ROOM = 0.40, 0.30, 0.30  # السياق
 
 TREND_EMA_FAST    = 20
 TREND_EMA_SLOW    = 50
@@ -156,7 +155,7 @@ def download_raw_batch(tickers: tuple, yf_interval: str, yf_period: str, status_
     return result
 
 # ═══════════════════════════════════════════════
-#  MARKET CAP FILTER
+#  MARKET CAP FILTER (تجاهل الشركات الصغيرة)
 # ═══════════════════════════════════════════════
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_market_cap(ticker: str):
@@ -170,14 +169,16 @@ def get_market_cap(ticker: str):
         return None
 
 # ═══════════════════════════════════════════════
-#  TREND FILTER (1H / 4H) — إضافة ناعمة (بدون تغيير)
+#  TREND FILTER (1H / 4H) — إضافة ناعمة وليست فلتر رفض
 # ═══════════════════════════════════════════════
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_trend_score(ticker: str, trend_tf: str) -> float:
     try:
         cfg = TF_CONFIG[trend_tf]
-        raw = yf.download(tickers=ticker, period=cfg["yf_period"], interval=cfg["yf_interval"],
-                          progress=False, auto_adjust=True)
+        raw = yf.download(
+            tickers=ticker, period=cfg["yf_period"], interval=cfg["yf_interval"],
+            progress=False, auto_adjust=True
+        )
         if raw is None or raw.empty:
             return 0.0
         close = raw["Close"]
@@ -201,17 +202,17 @@ def get_trend_score(ticker: str, trend_tf: str) -> float:
         return 0.0
 
 # ══════════════════════════════════════════════════════════════
-#  NORMALIZED CANDLE METRICS — قلب الرادار الجديد
+#  NORMALIZED CANDLE METRICS — قلب رادار الشموع
 # ══════════════════════════════════════════════════════════════
 def compute_candle_metrics(open_, high, low, close):
     """
-    يحوّل OHLC الخام إلى مقاييس موحّدة (0..1) تصف تشريح كل شمعة:
-      Body %   = abs(Close - Open) / Range        → حسم الحركة أم التردد
-      Upper %  = (High - max(C,O)) / Range        → الرفض البيعي في الأعلى
-      Lower %  = (min(C,O) - Low) / Range         → دعم الثيران في الأسفل
+    يحوّل OHLC الخام إلى مقاييس موحّدة (0..1) تشريحية:
+      Body %   = abs(Close - Open) / Range        → حسم الحركة أم تردد؟
+      Upper %  = (High - max(C,O)) / Range        → الرفض البيعي بالأعلى
+      Lower %  = (min(C,O) - Low) / Range         → دعم الثيران بالأسفل
       ClosePos = (Close - Low) / Range            → موقع الإغلاق (0=القاع، 1=القمة)
-    بما أن كل شيء نسبي إلى مدى الشمعة نفسها، فالنتائج قابلة للمقارنة
-    مباشرة بين أي فريمين. الشمعة المسطحة (Range≈0) → قيم محايدة.
+    كل القيم نسب من مدى الشمعة نفسها → شمعة 5 دقائق تقارَن بشمعة يومية مباشرة.
+    الشمعة المسطحة (Range≈0) → قيم محايدة.
     """
     rng = np.asarray(high) - np.asarray(low)
     flat = rng <= 1e-12
@@ -301,16 +302,16 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
     """
     Candle Radar 1.0 — يرصد فرص الشراء (BUY) فقط.
 
-    كل شمعة تُحوَّل أولاً إلى مقاييس موحّدة بالنسبة لمداها الخاص (Body/Upper/Lower/
-    ClosePos)، فتصبح شمعة 5 دقائق وشمعة يومية متكافئتين في التقييم.
+    كل شمعة تُحوَّل إلى مقاييس موحّدة بالنسبة لمداها الخاص (Body/Upper/Lower/
+    ClosePos) فتصبح شمعة 5 دقائق وشمعة يومية متكافئتين في التقييم تماماً.
 
     هيكل الأوزان:
-      • Candle Anatomy 40%  (ClosePos 50% + Body 30% + Wicks 20%)
+      • Candle Anatomy 40%     (ClosePos 50% + Body 30% + Wicks 20%)
       • Volume/Activity 30-35% (RVOL 55% + اتجاه الحجم 25% + توسّع المدى 20%)
-      • Context 20-25% (استمرارية الإغلاقات 40% + موقع المدى 30% + مساحة السيولة 30%)
-      • Trend Filter 10% — وزن ناعم إضافي فقط عند تفعيله، وليس شرط رفض.
+      • Context 20-25%         (استمرارية 40% + موقع المدى 30% + مساحة السيولة 30%)
+      • Trend Filter 10%       — وزن ناعم إضافي فقط عند تفعيله، وليس شرط رفض.
 
-    التدفق: Entry → SL → أقرب Liquidity TP → R:R (كما في الرادار السابق).
+    التدفق: Entry → SL → أقرب Liquidity TP → R:R (كما في الرادار الأول).
     """
     try:
         if df is None or len(df) < 35: return None
@@ -324,7 +325,7 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
         price = close[-1]
         i = len(close) - 1
 
-        # ═══ فلتر السعر والسيولة (RVOL يُحسب من الشموع السابقة فقط) ═══
+        # ═══ فلتر السعر والسيولة — RVOL يُحسب من الشموع السابقة فقط ═══
         if price < min_price: return None
         prior_window = vol[max(0, i - RVOL_LOOKBACK):i]
         avg_vol = prior_window.mean() if len(prior_window) > 0 else vol[i]
@@ -337,18 +338,17 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
 
         # ══════════════════════════════════════════════════════
         # 1. CANDLE ANATOMY — 40%
-        # (ClosePos 50% + Body 30% + Wicks 20%)
         # ══════════════════════════════════════════════════════
         body_arr, upper_arr, lower_arr, cpos_arr = compute_candle_metrics(open_, high, low, close)
-        body_pct    = float(body_arr[i])
-        upper_wick  = float(upper_arr[i])
-        lower_wick  = float(lower_arr[i])
-        close_pos   = float(cpos_arr[i])
-        direction   = 1.0 if close[i] > open_[i] else (-1.0 if close[i] < open_[i] else 0.0)
+        body_pct   = float(body_arr[i])
+        upper_wick = float(upper_arr[i])
+        lower_wick = float(lower_arr[i])
+        close_pos  = float(cpos_arr[i])
+        direction  = 1.0 if close[i] > open_[i] else (-1.0 if close[i] < open_[i] else 0.0)
 
         # أهم مؤشر: أين أغلق السعر داخل مدى الشمعة؟
         s_close = np.clip((close_pos - CLOSE_POS_MID) / CLOSE_POS_FULL, -1.0, 1.0)
-        # حسم الحركة: جسم كبير باتجاه صاعد = +1، جسم كبير هابط = -1، دوجي = 0
+        # حسم الحركة: جسم كبير صاعد = +1، جسم كبير هابط = -1، دوجي = 0
         s_body  = direction * np.clip(body_pct / BODY_FULL, -1.0, 1.0)
         # توازن الفتائل: دعم شرائي سفلي مقابل رفض بيعي علوي
         s_wick  = np.clip((lower_wick - upper_wick) / WICK_FULL, -1.0, 1.0)
@@ -365,7 +365,6 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
 
         # ══════════════════════════════════════════════════════
         # 2. VOLUME / ACTIVITY — 30-35%
-        # (RVOL 55% + اتجاه الحجم 25% + توسّع المدى 20%)
         # ══════════════════════════════════════════════════════
         rvol = vol[i] / (avg_vol + 1e-10)
         s_rvol = np.clip((rvol - 0.7) / 2.0, -0.5, 1.0)
@@ -390,7 +389,6 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
 
         # ══════════════════════════════════════════════════════
         # 3. CONTEXT — 20-25%
-        # (استمرارية 40% + موقع المدى 30% + مساحة السيولة 30%)
         # ══════════════════════════════════════════════════════
         # أ) استمرارية: متوسط موقع الإغلاق لآخر CANDLE_CONTEXT_LEN شموع
         ctx0 = max(0, i - CANDLE_CONTEXT_LEN + 1)
@@ -416,7 +414,7 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
         # ══════════════════════════════════════════════════════
         # ---- WEIGHTED EVIDENCE MODEL (Candle Radar 1.0) ----
         # فلتر الاتجاه وزن ناعم فقط: لا جلب شبكة إن كان أفضل سيناريو
-        # نظرياً لن يصل لعتبة score_min أصلاً.
+        # نظرياً (اتجاه +1 كامل) لن يصل أصلاً لعتبة score_min.
         # ══════════════════════════════════════════════════════
         trend_enabled = trend_tf is not None
         w_vol = WEIGHT_VOLUME_WITH_TREND if trend_enabled else WEIGHT_VOLUME_NO_TREND
@@ -432,7 +430,7 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
         if trend_enabled:
             if base_composite + WEIGHT_TREND < score_min:
                 return None
-            score_trend = get_trend_score(ticker, trend_tf)  # محايد (0.0) عند الفشل
+            score_trend = get_trend_score(ticker, trend_tf)  # محايد (0.0) عند الفشل، وليس رفضاً
             composite = float(np.clip(base_composite + (WEIGHT_TREND * score_trend), -1.0, 1.0))
         else:
             composite = base_composite
@@ -442,7 +440,7 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
             return None
         sig = "BUY (CANDLE+)"
 
-        # نمط الشمعة (للعرض)
+        # نمط الشمعة (للعرض فقط)
         pattern = classify_candle(open_[i], close[i], open_[i-1], close[i-1],
                                   body_pct, upper_wick, lower_wick, close_pos)
 
@@ -454,7 +452,7 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
                 return None
 
         # ══════════════════════════════════════════════════════════════
-        # التسلسل: Entry → SL → أقرب Liquidity TP → R:R (كما في السابق)
+        # التسلسل: Entry → SL → أقرب Liquidity TP → R:R (كما في الرادار الأول)
         # ══════════════════════════════════════════════════════════════
         tp_price = (high + low + close) / 3.0
         tpv = tp_price * vol
@@ -510,28 +508,27 @@ st.markdown("""
 .card-buy { background: linear-gradient(135deg,#0a2e12,#11471d); border-left: 5px solid #00e676; border-radius: 8px; padding: 12px; margin: 8px 0; color: #e0ffe0; }
 .tag-buy  { background:#00e676; color:#000; border-radius:4px; padding:2px 8px; font-weight:bold; font-size:0.8rem; }
 .metric-pill { background:#1e3a5f; color:#7dd3fc; border-radius:4px; padding:2px 6px; font-size:0.8rem; margin-right:5px;}
-.score-high { color: #00e676; font-weight: bold; }
 .candle-pill { background:#0f2a1a; color:#81c784; border-radius:4px; padding:2px 6px; font-size:0.8rem; margin-right:5px; }
+.score-high { color: #00e676; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🕯️ Candle Anatomy Radar 1.0")
+st.title("🕯️ Candle Radar 1.0")
 st.caption("تشريح الشمعة الموحّد (40%) + الحجم والنشاط (30-35%) + السياق والموقع (20-25%) + فلتر اتجاه 1H/4H — إشارات الشراء فقط")
-
-with st.expander("📖 كيف تقرأ مقاييس الشمعة الموحّدة؟", expanded=False):
-    st.markdown("""
-| المقياس | طريقة الحساب | ماذا يخبرنا؟ |
-|---|---|---|
-| **Range** | High − Low | التقلب الفعلي خلال الشمعة (أساس التوحيد) |
-| **Body %** | abs(C−O) / Range | حركة حاسمة باتجاه واحد أم تردد؟ |
-| **Upper %** | (High − max(C,O)) / Range | الرفض البيعي في الأعلى (ضغط الدببة) |
-| **Lower %** | (min(C,O) − Low) / Range | الرفض الشرائي في الأسفل (دعم الثيران) |
-| **Close@ %** | (Close − Low) / Range | **أهم مؤشر**: موقع الإغلاق (0=القاع، 100=القمة) |
-| **RVOL** | Volume / SMA(Vol, 20) | سيولة طبيعية أم اهتمام مؤسسي غير عادي؟ |
-
-لأن كل القيم نسب من مدى الشمعة نفسها، فشمعة 5 دقائق تُقارَن بشمعة يومية بنفس المسطرة تماماً.
-""")
 st.divider()
+
+with st.expander("📖 دليل قراءة مقاييس الشمعة الموحّدة", expanded=False):
+    st.markdown("""
+    <table style="width:100%; font-size:0.85rem; border-collapse:collapse;">
+      <tr style="background:#1e3a5f; color:#7dd3fc;"><th style="padding:6px;">المقياس</th><th style="padding:6px;">الحساب</th><th style="padding:6px;">المعنى</th></tr>
+      <tr><td style="padding:6px;"><b>Range</b></td><td style="padding:6px;">High − Low</td><td style="padding:6px;">التقلب الفعلي (أساس التوحيد)</td></tr>
+      <tr><td style="padding:6px;"><b>Body %</b></td><td style="padding:6px;">abs(C−O) / Range</td><td style="padding:6px;">حسم الحركة أم التردد؟</td></tr>
+      <tr><td style="padding:6px;"><b>Upper %</b></td><td style="padding:6px;">(High − max(C,O)) / Range</td><td style="padding:6px;">الرفض البيعي بالأعلى</td></tr>
+      <tr><td style="padding:6px;"><b>Lower %</b></td><td style="padding:6px;">(min(C,O) − Low) / Range</td><td style="padding:6px;">دعم الثيران بالأسفل</td></tr>
+      <tr><td style="padding:6px;"><b>Close@ %</b></td><td style="padding:6px;">(Close − Low) / Range</td><td style="padding:6px;"><b>الأهم</b>: موقع الإغلاق (0=القاع، 100=القمة)</td></tr>
+      <tr><td style="padding:6px;"><b>RVOL</b></td><td style="padding:6px;">Volume / SMA(Vol, 20)</td><td style="padding:6px;">سيولة طبيعية أم اهتمام مؤسسي؟</td></tr>
+    </table>
+    """, unsafe_allow_html=True)
 
 with st.spinner("📡 جلب القائمة الأساسية..."):
     nasdaq_tuple, source, err = fetch_all_nasdaq_symbols()
@@ -611,10 +608,9 @@ if st.button("🔍 SCAN MARKET NOW", type="primary", use_container_width=True):
     for r in results:
         mcap_pill = f'<span class="metric-pill">Market Cap: ${r["MarketCapB"]}B</span>' if r.get("MarketCapB") else ""
         trend_pill = f'<span class="metric-pill">Trend: {r["TR"]}</span>' if r.get("TR") is not None else ""
-        lower_w, body_w, upper_w = r["Lower"], r["Body"], r["Upper"]
         html = f"""
         <div class="card-buy">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
                 <span style="font-size:1.3rem; font-weight:bold; letter-spacing:1px;">{r['Ticker']}</span>
                 <span class="tag-buy">{r['Signal']}</span>
             </div>
@@ -625,27 +621,14 @@ if st.button("🔍 SCAN MARKET NOW", type="primary", use_container_width=True):
                 🛡️ SL: <b style="color:#ff5252">${r['SL']}</b> &nbsp;|&nbsp;
                 ⚖️ R:R <b>{r['RR']}</b>
             </div>
-            <div style="margin-bottom:6px;">
-                <div style="display:flex; height:8px; border-radius:3px; overflow:hidden; border:1px solid #1b5e20;">
-                    <div style="background:#00e676; width:{lower_w}%;"></div>
-                    <div style="background:#ffee58; width:{body_w}%;"></div>
-                    <div style="background:#ef5350; width:{upper_w}%;"></div>
-                </div>
-                <div style="font-size:0.7rem; color:#9e9e9e; margin-top:2px;">
-                    🟩 Lower {lower_w}% · 🟨 Body {body_w}% · 🟥 Upper {upper_w}% — تشريح الشمعة (100% من المدى)
-                </div>
-                <div style="background:#263238; border-radius:3px; height:6px; margin-top:6px; position:relative;">
-                    <div style="background:#00e676; height:6px; width:{r['ClosePos']}%; border-radius:3px;"></div>
-                    <div style="position:absolute; left:50%; top:-2px; height:10px; width:1px; background:#90a4ae;"></div>
-                </div>
-                <div style="font-size:0.7rem; color:#9e9e9e; margin-top:2px;">
-                    Close Position: <b>{r['ClosePos']}%</b> (0 = القاع · 50 = المنتصف · 100 = القمة)
-                </div>
-            </div>
             <div>
                 <span class="metric-pill">Anatomy (AN): {r['AN']}</span>
                 <span class="metric-pill">Volume (VLM): {r['VLM']}</span>
                 <span class="metric-pill">Context (CTX): {r['CTX']}</span>
+                <span class="candle-pill">Body: {r['Body']}%</span>
+                <span class="candle-pill">Upper: {r['Upper']}%</span>
+                <span class="candle-pill">Lower: {r['Lower']}%</span>
+                <span class="candle-pill">Close@: {r['ClosePos']}%</span>
                 <span class="candle-pill">RVOL: {r['RVOL']}x</span>
                 {trend_pill}
                 {mcap_pill}

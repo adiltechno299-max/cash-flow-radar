@@ -25,7 +25,21 @@ VOL_NORM_LOOKBACK  = 20   # نافذة حساب التذبذب (volatility) لت
 SWING_LEFT         = 2    # عدد الشموع على يسار القمة/القاع لتأكيده كـ Swing Point
 SWING_RIGHT        = 2    # عدد الشموع على يمين القمة/القاع لتأكيده (لا يمكن تأكيد قمة قبل مرور هذا العدد)
 LIQUIDITY_LOOKBACK = 50   # مدى البحث للخلف عن آخر تجمع سيولة (Swing) لم يتم "امتصاصه" بعد
-MIN_RISK_REWARD    = 1.2  # أدنى نسبة عائد/مخاطرة مقبولة لقبول الصفقة
+MIN_RISK_REWARD    = 1.2  # أدنى نسبة عائد/مخاطرة مقبولة (يتم تمديد TP للوصول لها، لا رفض الإشارة)
+
+# ── Cash Flow Radar 3.0 — أوزان النموذج المرجّح ──
+# عند تفعيل فلتر الاتجاه العام (Trend Filter): يُعاد توزيع الوزن بحيث
+# يحصل الاتجاه على وزن إضافي (10%) دون رفض أي إشارة بسببه (إضافة/خصم ناعم فقط).
+WEIGHT_CASH_FLOW            = 0.40   # ثابت دائماً: Cash Flow 40% (CMF + MFI)
+WEIGHT_LIQUIDITY_WITH_TREND = 0.30   # Liquidity عند تفعيل فلتر الاتجاه (ضمن نطاق 30-35%)
+WEIGHT_MOMENTUM_WITH_TREND  = 0.20   # Momentum عند تفعيل فلتر الاتجاه (ضمن نطاق 20-25%)
+WEIGHT_TREND                = 0.10   # Trend Filter (1H/4H) كوزن ناعم إضافي
+WEIGHT_LIQUIDITY_NO_TREND   = 0.35   # Liquidity عند تعطيل فلتر الاتجاه
+WEIGHT_MOMENTUM_NO_TREND    = 0.25   # Momentum عند تعطيل فلتر الاتجاه
+
+TREND_EMA_FAST   = 20     # المتوسط السريع لفلتر الاتجاه العام
+TREND_EMA_SLOW   = 50     # المتوسط البطيء لفلتر الاتجاه العام
+TREND_SPREAD_NORM = 0.03  # نسبة تباعد بين المتوسطين تعادل أقصى قوة اتجاه (±1.0)
 
 CHUNK_SIZE = 50  
 CACHE_TTL  = 60
@@ -167,6 +181,47 @@ def get_market_cap(ticker: str):
         return None
 
 # ═══════════════════════════════════════════════
+#  TREND FILTER (1H / 4H) — إضافة ناعمة وليست فلتر رفض
+# ═══════════════════════════════════════════════
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_trend_score(ticker: str, trend_tf: str) -> float:
+    """
+    يقيس اتجاه السهم على فريم أعلى (1H أو 4H) عبر تباعد متوسطين متحركين
+    أسّيين (EMA20 مقابل EMA50). كلما زاد تباعد EMA السريع فوق البطيء
+    زادت قوة الاتجاه الصاعد، والعكس صحيح.
+    هذا "فلتر ناعم" (soft score) وليس شرط قبول/رفض: عند تعذر الجلب أو
+    نقص البيانات يُرجع 0.0 (محايد) بدل استبعاد السهم، حتى لا تقل عدد
+    الإشارات بسبب مشاكل شبكة عابرة.
+    """
+    try:
+        cfg = TF_CONFIG[trend_tf]
+        raw = yf.download(
+            tickers=ticker, period=cfg["yf_period"], interval=cfg["yf_interval"],
+            progress=False, auto_adjust=True
+        )
+        if raw is None or raw.empty:
+            return 0.0
+        close = raw["Close"]
+        if isinstance(close, pd.DataFrame):  # قد يعيد yfinance عمود متعدد المستويات لسهم واحد
+            close = close.iloc[:, 0]
+        close = close.dropna()
+        if cfg.get("resample"):
+            df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            df = _resample_ohlcv(df, cfg["resample"])
+            close = df["Close"]
+        if len(close) < TREND_EMA_SLOW + 5:
+            return 0.0
+
+        ema_fast = close.ewm(span=TREND_EMA_FAST, adjust=False).mean()
+        ema_slow = close.ewm(span=TREND_EMA_SLOW, adjust=False).mean()
+
+        spread = (ema_fast.iloc[-1] - ema_slow.iloc[-1]) / (ema_slow.iloc[-1] + 1e-10)
+        score = float(np.clip(spread / TREND_SPREAD_NORM, -1.0, 1.0))
+        return score if np.isfinite(score) else 0.0
+    except Exception:
+        return 0.0
+
+# ═══════════════════════════════════════════════
 #  INDICATORS & CHAIKIN MONEY FLOW (CMF)
 # ═══════════════════════════════════════════════
 def _rolling_sum(arr, period):
@@ -276,11 +331,19 @@ def find_liquidity_pools(high, low, swing_high, swing_low, i, lookback=50):
         ssl = np.min(low[start:i]) if i > start else low[i]
     return bsl, ssl
 
-def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_cap=0.0):
+def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_cap=0.0, trend_tf=None):
     """
-    ملاحظة: ترصد هذه الدالة فرص الشراء (BUY) فقط.
-    أي إشارة بيع (Composite سالب) يتم تجاهلها تماماً ولا تُرجع كنتيجة.
-    كما يتم تجاهل الشركات ذات القيمة السوقية الأقل من min_market_cap (بالدولار).
+    Cash Flow Radar 3.0 — ترصد هذه الدالة فرص الشراء (BUY) فقط.
+
+    هيكل الأوزان:
+      • Cash Flow  40%  (CMF 60% + MFI 40%)
+      • Liquidity  30-35% (RVOL 60% + Liquidity/Swing Structure 40%)
+      • Momentum   20-25% (Price momentum 70% + OBV 30%)
+      • Trend Filter (1H/4H) 10% — وزن ناعم إضافي فقط عند تفعيله، وليس شرط رفض.
+
+    التدفق: Entry → SL → أقرب Liquidity TP → R:R.
+    لا يوجد أي رفض غير ضروري للإشارات: فلتر الاتجاه إضافة/خصم ناعم على
+    الـ Score فقط، وفشل جلبه لا يستبعد السهم (يُعامل كمحايد = 0).
     """
     try:
         if df is None or len(df) < 35: return None
@@ -295,15 +358,16 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
         
         # ══════════════════════════════════════════════════════
         # فلتر السعر والسيولة — RVOL/متوسط الحجم يُحسب من الشموع
-        # السابقة فقط، بدون تضمين الشمعة الحالية (تفادي تحيّز النظر
-        # للأمام / self-reference).
+        # السابقة فقط، بدون تضمين الشمعة الحالية.
         # ══════════════════════════════════════════════════════
         if price < min_price: return None
         prior_window = vol[max(0, i - RVOL_LOOKBACK):i]  # يستبعد الشمعة i نفسها
         avg_vol = prior_window.mean() if len(prior_window) > 0 else vol[i]
         if avg_vol < min_vol_avg: return None
 
-        # 1. CASH FLOW (التدفق النقدي المؤسساتي - CMF & MFI) - [الوزن: 40%]
+        # ══════════════════════════════════════════════════════
+        # 1. CASH FLOW — 40% (CMF 60% + MFI 40%)
+        # ══════════════════════════════════════════════════════
         cmf_arr = calculate_cmf(high, low, close, vol, CMF_PERIOD)
         cmf_val = cmf_arr[i]
 
@@ -314,24 +378,42 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
         s_cf_mfi = np.clip((mfi_val - 50) / 30.0, -1.0, 1.0)
         score_cash_flow = (s_cf_cmf * 0.6) + (s_cf_mfi * 0.4)
 
-        # 2. LIQUIDITY (السيولة اللحظية وانفجار الحجم - RVOL) - [الوزن: 35%]
-        rvol = vol[i] / (avg_vol + 1e-10)
-        score_liquidity = np.clip((rvol - 0.7) / 2.0, -0.5, 1.0)
-        if rvol < 0.4: score_liquidity = -1.0
+        # ══════════════════════════════════════════════════════
+        # تحديد Swing Points وتجمعات السيولة (Liquidity Pools) مبكراً،
+        # لاستخدامها في: (أ) درجة السيولة الهيكلية أدناه، و(ب) SL/TP لاحقاً.
+        # ══════════════════════════════════════════════════════
+        swing_high, swing_low = find_swing_points(high, low, SWING_LEFT, SWING_RIGHT)
+        bsl_pool, ssl_pool = find_liquidity_pools(high, low, swing_high, swing_low, i, LIQUIDITY_LOOKBACK)
+        tr = max(high[i]-low[i], abs(high[i]-close[i-1]), abs(low[i]-close[i-1]))
+        tr = tr if np.isfinite(tr) and tr > 0 else price * 0.01
 
         # ══════════════════════════════════════════════════════
-        # 3. MOMENTUM (الزخم والتسارع - OBV & Price ROC) - [الوزن: 25%]
-        # بدل الثوابت اليدوية (25x, 5x)، يتم تطبيع كل من تغيّر السعر
-        # وتغيّر OBV إحصائياً (z-score) بالنسبة لتذبذبهما الطبيعي على
-        # مدى VOL_NORM_LOOKBACK شمعة، ثم ضغط الناتج إلى [-1, 1].
+        # 2. LIQUIDITY — 30-35% (RVOL 60% + Liquidity/Swing Structure 40%)
+        # ══════════════════════════════════════════════════════
+        rvol = vol[i] / (avg_vol + 1e-10)
+        score_liquidity_rvol = np.clip((rvol - 0.7) / 2.0, -0.5, 1.0)
+        if rvol < 0.4: score_liquidity_rvol = -1.0
+
+        # درجة هيكلية: هل المساحة نحو أقرب سيولة علوية (هدف محتمل) أكبر من
+        # المسافة نحو أقرب سيولة سفلية (دعم/وقف قريب)؟ هذا انعكاس حقيقي
+        # لبنية السيولة (Swing) بدل الاعتماد فقط على RVOL.
+        room_up = bsl_pool - price
+        room_down = price - ssl_pool
+        score_liquidity_structure = np.clip((room_up - room_down) / (tr * 5.0 + 1e-10), -1.0, 1.0)
+
+        score_liquidity = np.clip((score_liquidity_rvol * 0.6) + (score_liquidity_structure * 0.4), -1.0, 1.0)
+
+        # ══════════════════════════════════════════════════════
+        # 3. MOMENTUM — 20-25% (Price momentum 70% + OBV 30%)
+        # تطبيع إحصائي (z-score) لكل من تغيّر السعر وتغيّر OBV بالنسبة
+        # لتذبذبهما الطبيعي على مدى VOL_NORM_LOOKBACK شمعة.
         # ══════════════════════════════════════════════════════
         d = np.sign(np.diff(close))
         obv = np.empty(len(close))
         obv[0] = vol[0]
         for j in range(1, len(close)): obv[j] = obv[j - 1] + d[j - 1] * vol[j]
-        obv_step = np.diff(obv)  # obv_step[k] = obv[k+1]-obv[k]
+        obv_step = np.diff(obv)
 
-        # --- تطبيع تغيّر OBV إحصائياً ---
         obv_change = obv[i] - obv[i - OBV_SLOPE_LEN]
         recent_obv_steps = obv_step[max(0, i - VOL_NORM_LOOKBACK):i]
         obv_std = recent_obv_steps.std() if len(recent_obv_steps) >= 5 else np.nan
@@ -340,9 +422,8 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
         else:
             expected_obv_dispersion = obv_std * np.sqrt(OBV_SLOPE_LEN)
             obv_z_score = obv_change / (expected_obv_dispersion + 1e-10)
-        score_obv = np.clip(obv_z_score / 3.0, -1.0, 1.0)  # ±3 انحراف معياري يغطي تقريباً المدى الكامل
+        score_obv = np.clip(obv_z_score / 3.0, -1.0, 1.0)
 
-        # --- تطبيع تغيّر السعر إحصائياً (نسبة إلى تذبذبه التاريخي) ---
         returns = np.diff(close) / close[:-1]
         prc_change = (close[i] - close[i - OBV_SLOPE_LEN]) / (close[i - OBV_SLOPE_LEN] + 1e-10)
         recent_returns = returns[max(0, i - VOL_NORM_LOOKBACK):i]
@@ -356,12 +437,32 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
 
         score_momentum = np.clip((score_price * 0.7) + (score_obv * 0.3), -1.0, 1.0)
 
-        # ---- WEIGHTED EVIDENCE MODEL ----
-        composite = float(
-            (0.40 * score_cash_flow) + 
-            (0.35 * score_liquidity) + 
-            (0.25 * score_momentum)
+        # ══════════════════════════════════════════════════════
+        # ---- WEIGHTED EVIDENCE MODEL (Cash Flow Radar 3.0) ----
+        # فلتر الاتجاه (Trend Filter) وزن ناعم إضافي فقط: نحسب الـ composite
+        # الأساسي أولاً، وإن لم يكن هناك حتى نظرياً (بأفضل اتجاه ممكن) أمل
+        # ببلوغ score_min نتجنب استدعاء الشبكة إطلاقاً لجلب الاتجاه.
+        # ══════════════════════════════════════════════════════
+        trend_enabled = trend_tf is not None
+        w_liq = WEIGHT_LIQUIDITY_WITH_TREND if trend_enabled else WEIGHT_LIQUIDITY_NO_TREND
+        w_mom = WEIGHT_MOMENTUM_WITH_TREND if trend_enabled else WEIGHT_MOMENTUM_NO_TREND
+
+        base_composite = float(
+            (WEIGHT_CASH_FLOW * score_cash_flow) +
+            (w_liq * score_liquidity) +
+            (w_mom * score_momentum)
         )
+
+        score_trend = 0.0
+        if trend_enabled:
+            # لا داعي لجلب الاتجاه إن كان أفضل سيناريو ممكن (اتجاه صاعد كامل +1)
+            # لن يوصل الـ composite أصلاً لعتبة score_min — توفير طلبات شبكة.
+            if base_composite + WEIGHT_TREND < score_min:
+                return None
+            score_trend = get_trend_score(ticker, trend_tf)  # محايد (0.0) عند الفشل، وليس رفضاً
+            composite = float(np.clip(base_composite + (WEIGHT_TREND * score_trend), -1.0, 1.0))
+        else:
+            composite = base_composite
 
         # ══════════════════════════════════════════════════════
         # فقط إشارات الشراء (BUY): يتم تجاهل أي شيء غير ذلك بالكامل
@@ -382,9 +483,11 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
                 return None
 
         # ══════════════════════════════════════════════════════════════
-        # منطق الـ SL و TP المبني على "تمركز السيولة" (Liquidity Pools) الحقيقية:
-        # نبحث عن أقرب Swing High/Low لم يُمتَص بعد (unmitigated) بدل مجرد
-        # أعلى/أدنى سعر في نافذة قصيرة.
+        # التسلسل المطلوب: Entry → SL → أقرب Liquidity TP → R:R
+        # SL: أقرب تجمع سيولة سفلي (ssl_pool) أو VWAP أيهما أقرب، مع هامش أمان.
+        # TP: أقرب تجمع سيولة علوي غير ممتص (bsl_pool)، ويُمدَّد فقط إذا كان
+        #     قريباً جداً بما لا يحقق حداً أدنى معقولاً من العائد/المخاطرة
+        #     (لا يتم رفض الإشارة أبداً بسبب ذلك — فقط تعديل الهدف).
         # ══════════════════════════════════════════════════════════════
         tp_price = (high + low + close) / 3.0
         tpv = tp_price * vol
@@ -392,40 +495,40 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
         r_vol = _rolling_sum(vol, 14)
         vwap = r_tpv[i] / (r_vol[i] + 1e-10)
 
-        swing_high, swing_low = find_swing_points(high, low, SWING_LEFT, SWING_RIGHT)
-        bsl_pool, ssl_pool = find_liquidity_pools(high, low, swing_high, swing_low, i, LIQUIDITY_LOOKBACK)
+        buffer = tr * 0.2
 
-        tr = max(high[i]-low[i], abs(high[i]-close[i-1]), abs(low[i]-close[i-1]))
-        buffer = tr * 0.2 if np.isfinite(tr) and tr > 0 else price * 0.002
-
+        # Entry
+        entry = price
+        # SL
         sl = (min(ssl_pool, vwap) - buffer) if price > vwap else (ssl_pool - buffer)
-        risk = price - sl
-        tp = bsl_pool if (bsl_pool - price) > (risk * 1.0) else price + (risk * 2.0)
+        risk = entry - sl
+        # TP = أقرب Liquidity Pool علوي
+        tp = bsl_pool
+        if not ((bsl_pool - entry) > (risk * 1.0)):
+            # التجمع الأقرب قريب جداً؛ نمدّ الهدف بمقياس حركة مكافئة بدل رفض الإشارة
+            tp = entry + (risk * 2.0)
 
         # ══════════════════════════════════════════════════════════════
-        # التحقق (Validation) من صلاحية TP/SL قبل قبول الإشارة:
-        # - يجب أن تكون كل القيم رقمية صالحة (finite)
-        # - المخاطرة (risk) والعائد (reward) يجب أن يكونا موجبين فعلياً
-        # - فرض حد أدنى لنسبة العائد/المخاطرة (Risk:Reward)، وإن لم يتحقق
-        #   يتم تمديد TP لتحقيق الحد الأدنى بدل رفض إشارة جيدة الأساس
+        # التحقق (Validation) من صلاحية TP/SL قبل قبول الإشارة
         # ══════════════════════════════════════════════════════════════
-        if not all(np.isfinite(v) for v in (sl, tp, risk, price)):
+        if not all(np.isfinite(v) for v in (sl, tp, risk, entry)):
             return None
-        if risk <= 0:               # SL غير منطقي (فوق أو يساوي السعر الحالي)
+        if risk <= 0:
             return None
-        reward = tp - price
-        if reward <= 0:              # TP غير منطقي (تحت السعر الحالي)
+        reward = tp - entry
+        if reward <= 0:
             return None
 
         rr = reward / risk
         if rr < MIN_RISK_REWARD:
-            tp = price + (risk * MIN_RISK_REWARD)
-            reward = tp - price
+            tp = entry + (risk * MIN_RISK_REWARD)
+            reward = tp - entry
             rr = reward / risk
 
         return dict(
-            Ticker=ticker, Signal=sig, Price=round(price, 2),
+            Ticker=ticker, Signal=sig, Price=round(entry, 2),
             CF=round(score_cash_flow, 2), LQ=round(score_liquidity, 2), MO=round(score_momentum, 2),
+            TR=round(score_trend, 2) if trend_enabled else None,
             RVOL=round(rvol, 2), CMF=round(cmf_val, 2), MFI=round(mfi_val, 1),
             TP=round(tp, 2), SL=round(sl, 2), RR=round(rr, 2),
             MarketCapB=round(mcap / 1e9, 2) if mcap else None,
@@ -437,7 +540,7 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
 # ═══════════════════════════════════════════════
 #  STREAMLIT UI
 # ═══════════════════════════════════════════════
-st.set_page_config(page_title="Cash Flow & Momentum Radar ⚡", page_icon="⚡", layout="centered")
+st.set_page_config(page_title="Cash Flow Radar 3.0 ⚡", page_icon="⚡", layout="centered")
 
 st.markdown("""
 <style>
@@ -449,8 +552,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🌊 Cash Flow + Liquidity + Momentum Radar")
-st.caption("Advanced Institutional Flow & Liquidity Engine (CMF + RVOL + Order Flow) — إشارات الشراء فقط")
+st.title("🌊 Cash Flow Radar 3.0")
+st.caption("Cash Flow (40%) + Liquidity/Swing (30-35%) + Momentum (20-25%) + فلتر اتجاه 1H/4H — إشارات الشراء فقط")
 st.divider()
 
 with st.spinner("📡 جلب القائمة الأساسية..."):
@@ -475,13 +578,24 @@ with st.expander("⚙️ إعدادات الرادار الثلاثي", expanded
     )
     min_market_cap = min_market_cap_b * 1_000_000_000
 
+    trend_choice = st.selectbox(
+        "🧭 فلتر الاتجاه العام (Trend Filter)",
+        ["1h", "4h", "تعطيل"],
+        index=0,
+        format_func=lambda x: {"1h": "🕒 1 ساعة (1H)", "4h": "📈 4 ساعات (4H)", "تعطيل": "🚫 بدون فلتر اتجاه"}[x],
+        help="وزن إضافي ناعم (10%) يعكس اتجاه السهم على فريم أعلى (EMA20 مقابل EMA50). "
+             "لا يرفض أي إشارة بمفرده — فقط يرفع أو يخفض الـ Score قليلاً، حفاظاً على تكرار الإشارات."
+    )
+    trend_tf = None if trend_choice == "تعطيل" else trend_choice
+
     search_input = st.text_input("🔑 إضافة أسهم مخصصة (مفصولة بفاصلة)", placeholder="مثال: AAPL, TSLA, NVDA")
 
 custom_tickers = [x.strip().upper() for x in re.split(r'[,\s]+', search_input) if x.strip()]
 scan_list = list(dict.fromkeys(custom_tickers + nasdaq_all[:max_stocks]))
 
 mcap_note = f"وتجاهل الشركات أقل من **{min_market_cap_b:g} مليار $**" if min_market_cap > 0 else "بدون فلتر قيمة سوقية"
-st.info(f"سيتم فحص **{len(scan_list)}** سهم على فريم **{tf}** — عرض فرص **الشراء فقط** {mcap_note}.")
+trend_note = f"مع فلتر اتجاه **{trend_tf.upper()}** (وزن ناعم)" if trend_tf else "بدون فلتر اتجاه"
+st.info(f"سيتم فحص **{len(scan_list)}** سهم على فريم **{tf}** — عرض فرص **الشراء فقط** {mcap_note}، {trend_note}.")
 if max_stocks >= 1000:
     st.caption("⚠️ مسح عدد كبير من الأسهم قد يستغرق وقتاً أطول بسبب حدود طلبات Yahoo Finance.")
 
@@ -505,7 +619,7 @@ if st.button("🔍 SCAN MARKET NOW", type="primary", use_container_width=True):
         )
         
         for ticker, df in raw_data.items():
-            sig = get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_cap)
+            sig = get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_cap, trend_tf)
             if sig:
                 results.append(sig)
                 
@@ -520,6 +634,7 @@ if st.button("🔍 SCAN MARKET NOW", type="primary", use_container_width=True):
     
     for r in results:
         mcap_pill = f'<span class="metric-pill">Market Cap: ${r["MarketCapB"]}B</span>' if r.get("MarketCapB") else ""
+        trend_pill = f'<span class="metric-pill">Trend: {r["TR"]}</span>' if r.get("TR") is not None else ""
         html = f"""
         <div class="card-buy">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
@@ -538,6 +653,7 @@ if st.button("🔍 SCAN MARKET NOW", type="primary", use_container_width=True):
                 <span class="metric-pill">Momentum (MO): {r['MO']}</span>
                 <span class="metric-pill">CMF: {r['CMF']}</span>
                 <span class="metric-pill">MFI: {r['MFI']}</span>
+                {trend_pill}
                 {mcap_pill}
                 <span class="metric-pill">Score: <span class="score-high">{r['Score']}</span></span>
             </div>

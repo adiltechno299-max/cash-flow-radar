@@ -4,124 +4,127 @@ import pandas as pd
 import numpy as np
 
 # ==========================================
-# 1. دوال التحليل الكمي (Feature & Target Engineering)
+# إعدادات الواجهة
 # ==========================================
-@st.cache_data(ttl=3600)
-def load_and_prep_data(ticker, period="1y", interval="1d"):
-    df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-    if isinstance(df.columns, pd.MultiIndex):
-        df = df.xs(ticker, axis=1, level=1)
-    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-    return df
+st.set_page_config(page_title="Candlestick Radar Scanner", layout="wide")
 
-def engineer_features(df):
-    df = df.copy()
-    df['Range'] = df['High'] - df['Low']
-    df['Range'] = df['Range'].replace(0, 1e-10) 
-    
-    # تشريح الشمعة
-    df['Body_%'] = abs(df['Close'] - df['Open']) / df['Range'] * 100
-    df['Upper_Wick_%'] = (df['High'] - df[['Open', 'Close']].max(axis=1)) / df['Range'] * 100
-    df['Lower_Wick_%'] = (df[['Open', 'Close']].min(axis=1) - df['Low']) / df['Range'] * 100
-    df['Close_Position_%'] = (df['Close'] - df['Low']) / df['Range'] * 100
-    
-    # السياق
-    df['SMA_Volume_20'] = df['Volume'].rolling(20).mean()
-    df['Relative_Volume'] = df['Volume'] / (df['SMA_Volume_20'] + 1e-10)
-    
-    return df
-
-def engineer_targets(df, n_candles):
-    df = df.copy()
-    # العائد بعد N شموع
-    df[f'Target_Return_{n_candles}C_%'] = (df['Close'].shift(-n_candles) - df['Close']) / df['Close'] * 100
-    
-    # أقصى انعكاس سلبي (Drawdown) خلال الـ N شموع
-    future_lows = df['Low'].iloc[::-1].rolling(n_candles).min().iloc[::-1]
-    df[f'Max_Drawdown_{n_candles}C_%'] = (future_lows.shift(-1) - df['Close']) / df['Close'] * 100
-    
-    return df
+st.title("🎯 رادار الشموع الكمي (Candlestick Radar)")
+st.markdown("يقوم هذا الرادار بمسح قائمة أصول السوق تلقائياً عبر بيانات **Yahoo Finance**، والبحث عن الشموع التي تطابق المعايير الكمية لرفض الأسعار والسيولة في آخر شمعة مغلقة.")
 
 # ==========================================
-# 2. واجهة Streamlit
+# الشريط الجانبي للإعدادات والفلاتر
 # ==========================================
-st.set_page_config(page_title="Quantitative Candlestick Engine", layout="wide")
+st.sidebar.header("⚙️ إعدادات الرادار")
 
-st.title("📊 محرك التحليل الكمي للشموع اليابانية")
-st.markdown("ابحث عن **الميزة الإحصائية (Edge)** من خلال اختبار أشكال الشموع والسيولة ضد البيانات التاريخية الحقيقية.")
+default_tickers = "AAPL, MSFT, TSLA, NVDA, GOOGL, AMZN, META, AMD, NFLX, BTC-USD, ETH-USD, EURUSD=X, GC=X"
+tickers_input = st.sidebar.text_area("قائمة الرموز (مفصولة بفاصلة)", value=default_tickers, height=100)
+tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
-# إعدادات البيانات
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    ticker = st.text_input("رمز السهم (Ticker)", value="AAPL")
-with col2:
-    interval = st.selectbox("الإطار الزمني", ["1h", "1d", "1wk"], index=1)
-with col3:
-    period = st.selectbox("مدة البيانات", ["6mo", "1y", "2y", "5y"], index=2)
-with col4:
-    n_candles = st.number_input("قياس المستقبل (بعد كم شمعة؟)", min_value=1, max_value=20, value=5)
+period = st.sidebar.selectbox("فترة البيانات التاريخية", ["1mo", "3mo", "6mo", "1y"], index=1)
+interval = st.sidebar.selectbox("الإطار الزمني", ["1d", "1h"], index=0)
 
-# جلب ومعالجة البيانات
-if st.button("تحميل ومعالجة البيانات", type="primary"):
-    with st.spinner("جاري جلب البيانات وحساب الميزات..."):
-        raw_df = load_and_prep_data(ticker, period, interval)
-        if raw_df.empty:
-            st.error("لم يتم العثور على بيانات. تأكد من الرمز.")
+st.sidebar.divider()
+st.sidebar.subheader("🛠️ الشروط الكمية للشمعة الأخيرة")
+min_lower_wick = st.sidebar.slider("الحد الأدنى للذيل السفلي (%)", 0, 100, 50, help="رفض قوي من الأسفل (مثل البن بار)")
+max_body = st.sidebar.slider("الحد الأقصى لحجم الجسم (%)", 0, 100, 30, help="جسم شمعة صغيراً نسبياً")
+min_close_pos = st.sidebar.slider("الحد الأدنى لموقع الإغلاق (%)", 0, 100, 70, help="الإغلاق قرب أعلى الشمعة")
+min_rvol = st.sidebar.slider("الحد الأدنى للسيولة النسبية (RVOL)", 0.0, 5.0, 1.2, 0.1, help="حجم تداول أعلى من المتوسط بـ N مرة")
+
+# ==========================================
+# دالة فحص وحساب الخصائص لكل أصل
+# ==========================================
+@st.cache_data(ttl=1800)
+def scan_ticker(ticker, period, interval):
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+        if isinstance(df.columns, pd.MultiIndex):
+            df = df.xs(ticker, axis=1, level=1)
+        if df.empty or len(df) < 25:
+            return None
+        
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+        
+        # هندسة الميزات الكمية
+        df['Range'] = df['High'] - df['Low']
+        df['Range'] = df['Range'].replace(0, 1e-10)
+        
+        df['Body_%'] = abs(df['Close'] - df['Open']) / df['Range'] * 100
+        df['Upper_Wick_%'] = (df['High'] - df[['Open', 'Close']].max(axis=1)) / df['Range'] * 100
+        df['Lower_Wick_%'] = (df[['Open', 'Close']].min(axis=1) - df['Low']) / df['Range'] * 100
+        df['Close_Position_%'] = (df['Close'] - df['Low']) / df['Range'] * 100
+        
+        df['SMA_Volume_20'] = df['Volume'].rolling(20).mean()
+        df['Relative_Volume'] = df['Volume'] / (df['SMA_Volume_20'] + 1e-10)
+        
+        # أخذ الشمعة المكتملة الأخيرة (قبل الأخيرة في الإطار)
+        prev = df.iloc[-2]
+        
+        return {
+            'Ticker': ticker,
+            'Time': df.index[-2],
+            'Close': prev['Close'],
+            'Body_%': prev['Body_%'],
+            'Lower_Wick_%': prev['Lower_Wick_%'],
+            'Close_Position_%': prev['Close_Position_%'],
+            'Relative_Volume': prev['Relative_Volume']
+        }
+    except Exception:
+        return None
+
+# ==========================================
+# تشغيل الرادار عند الضغط على الزر
+# ==========================================
+if st.button("🚀 تشغيل رادار الفحص الشامل", type="primary"):
+    results = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, t in enumerate(tickers):
+        status_text.text(f"جاري فحص: {t} ({i+1}/{len(tickers)})")
+        res = scan_ticker(t, period, interval)
+        if res:
+            results.append(res)
+        progress_bar.progress((i + 1) / len(tickers))
+        
+    status_text.text("اكتمل الفحص بنجاح!")
+    progress_bar.empty()
+    
+    if results:
+        scan_df = pd.DataFrame(results)
+        
+        # تصفية النتائج بناءً على الفلاتر الكمية
+        matched_df = scan_df[
+            (scan_df['Lower_Wick_%'] >= min_lower_wick) &
+            (scan_df['Body_%'] <= max_body) &
+            (scan_df['Close_Position_%'] >= min_close_pos) &
+            (scan_df['Relative_Volume'] >= min_rvol)
+        ].copy()
+        
+        st.divider()
+        
+        c1, c2 = st.columns(2)
+        c1.metric("إجمالي الأصول التي تم فحصها", len(scan_df))
+        c2.metric("الأصول المطابقة للشروط الآن", len(matched_df))
+        
+        st.subheader("📡 الأصول المطابقة لإشارات الرادار:")
+        if not matched_df.empty:
+            st.dataframe(matched_df.style.format({
+                'Close': "{:.2f}",
+                'Body_%': "{:.1f}%",
+                'Lower_Wick_%': "{:.1f}%",
+                'Close_Position_%': "{:.1f}%",
+                'Relative_Volume': "{:.2f}x"
+            }), use_container_width=True)
         else:
-            features_df = engineer_features(raw_df)
-            final_df = engineer_targets(features_df, n_candles).dropna()
-            st.session_state['data'] = final_df
-            st.success(f"تمت معالجة {len(final_df)} شمعة بنجاح.")
-
-st.divider()
-
-# قسم الفلاتر التفاعلية (صناعة الاستراتيجية)
-if 'data' in st.session_state:
-    st.subheader("🛠️ بناء الاستراتيجية (تحديد شروط الشمعة)")
-    
-    df = st.session_state['data']
-    
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        min_lower_wick = st.slider("الحد الأدنى للذيل السفلي (%)", 0, 100, 50)
-    with c2:
-        max_body = st.slider("الحد الأقصى لحجم الجسم (%)", 0, 100, 30)
-    with c3:
-        min_close_pos = st.slider("الحد الأدنى لموقع الإغلاق (%)", 0, 100, 70, help="100% يعني إغلاق عند أعلى نقطة (High)")
-    with c4:
-        min_rvol = st.slider("الحد الأدنى للسيولة النسبية (RVOL)", 0.0, 5.0, 1.2, 0.1)
-
-    # تطبيق الفلاتر
-    condition = (
-        (df['Lower_Wick_%'] >= min_lower_wick) &
-        (df['Body_%'] <= max_body) &
-        (df['Close_Position_%'] >= min_close_pos) &
-        (df['Relative_Volume'] >= min_rvol)
-    )
-    
-    filtered_df = df[condition].copy()
-    
-    st.divider()
-    
-    # عرض النتائج الإحصائية
-    st.subheader(f"📈 نتائج الاختبار الإحصائي (خلال الـ {n_candles} شموع التالية)")
-    
-    total_signals = len(filtered_df)
-    
-    if total_signals > 0:
-        win_rate = (len(filtered_df[filtered_df[f'Target_Return_{n_candles}C_%'] > 0]) / total_signals) * 100
-        avg_return = filtered_df[f'Target_Return_{n_candles}C_%'].mean()
-        avg_drawdown = filtered_df[f'Max_Drawdown_{n_candles}C_%'].mean()
-        
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("عدد الإشارات المطابقة", f"{total_signals} شمعة")
-        m2.metric("نسبة الصفقات الرابحة (Win Rate)", f"{win_rate:.1f}%")
-        m3.metric("متوسط العائد المتوقع", f"{avg_return:.2f}%")
-        m4.metric("متوسط الانعكاس (Drawdown)", f"{avg_drawdown:.2f}%", help="يساعدك في تحديد مكان الـ Stop Loss")
-        
-        st.write("### تفاصيل الشموع التي طابقت الشروط:")
-        cols_to_display = ['Close', 'Relative_Volume', 'Lower_Wick_%', 'Close_Position_%', f'Target_Return_{n_candles}C_%', f'Max_Drawdown_{n_candles}C_%']
-        st.dataframe(filtered_df[cols_to_display].style.format("{:.2f}"))
-        
+            st.warning("لا توجد أصول تطابق هذه المعايير الصارمة في آخر شمعة. جرب خفض نسب الذيل أو السيولة من القائمة الجانبية.")
+            
+        with st.expander("عرض تفاصيل كافة الأصول المفحوصة"):
+            st.dataframe(scan_df.style.format({
+                'Close': "{:.2f}",
+                'Body_%': "{:.1f}%",
+                'Lower_Wick_%': "{:.1f}%",
+                'Close_Position_%': "{:.1f}%",
+                'Relative_Volume': "{:.2f}x"
+            }), use_container_width=True)
     else:
-        st.warning("لا توجد شموع تطابق هذه الشروط القاسية. حاول تخفيف الشروط من المنزلقات أعلاه.")
+        st.error("تعذر جلب البيانات من المصدر. تأكد من اتصال الإنترنت وصحة رموز الأصول.")

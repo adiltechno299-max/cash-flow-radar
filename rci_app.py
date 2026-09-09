@@ -68,6 +68,8 @@ TF_CONFIG = {
     "5m" : {"yf_interval": "5m",  "yf_period": "5d", "label": "🔥 5 Minutes (Day Trade)"},
     "15m": {"yf_interval": "15m", "yf_period": "5d", "label": "⏱️ 15 Minutes (Intraday)"},
     "1h" : {"yf_interval": "1h",  "yf_period": "60d","label": "🕒 1 Hour (Hourly Trend)"},
+    "4h" : {"yf_interval": "1h",  "yf_period": "180d","label": "📈 4 Hours (Swing)", "resample": "4h"},
+    "1d" : {"yf_interval": "1d",  "yf_period": "1y", "label": "📅 1 Day (Position/Swing)"},
 }
 
 # ═══════════════════════════════════════════════
@@ -104,7 +106,22 @@ def _download_chunk_with_backoff(chunk, yf_interval, yf_period, status_cb=None):
                 status_cb(f"🌐 خطأ شبكة/تقييد معدل الطلبات، إعادة المحاولة {attempt}/{MAX_RETRIES} بعد {sleep_time:.1f}ث...")
             time.sleep(sleep_time)
 
-def download_raw_batch(tickers: tuple, yf_interval: str, yf_period: str, status_cb=None) -> dict:
+def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """
+    يجمّع شموع أقصر (مثل 1H) إلى شموع أطول (مثل 4H) عبر pandas resample.
+    يعتمد على أن الفهرس (index) هو DatetimeIndex قادم من yfinance.
+    """
+    agg = {
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum",
+    }
+    out = df.resample(rule).agg(agg).dropna()
+    return out
+
+def download_raw_batch(tickers: tuple, yf_interval: str, yf_period: str, status_cb=None, resample_rule: str = None) -> dict:
     tickers = list(tickers)
     result = {}
     chunks = [tickers[i:i + CHUNK_SIZE] for i in range(0, len(tickers), CHUNK_SIZE)]
@@ -116,6 +133,8 @@ def download_raw_batch(tickers: tuple, yf_interval: str, yf_period: str, status_
                 try:
                     df = raw[ticker].copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
                     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                    if resample_rule:
+                        df = _resample_ohlcv(df, resample_rule)
                     result[ticker] = df if len(df) > 35 else None
                 except:
                     result[ticker] = None
@@ -347,7 +366,8 @@ if st.button("🔍 SCAN MARKET NOW", type="primary", use_container_width=True):
         cfg = TF_CONFIG[tf]
         raw_data = download_raw_batch(
             tuple(chunk), cfg["yf_interval"], cfg["yf_period"],
-            status_cb=lambda msg: status_text.text(msg)
+            status_cb=lambda msg: status_text.text(msg),
+            resample_rule=cfg.get("resample")
         )
         
         for ticker, df in raw_data.items():

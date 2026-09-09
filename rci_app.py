@@ -2,7 +2,6 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import requests
 
 # ==========================================
 # إعدادات الواجهة
@@ -32,23 +31,11 @@ min_close_pos = st.sidebar.slider("الحد الأدنى لموقع الإغلا
 min_rvol = st.sidebar.slider("الحد الأدنى للسيولة النسبية (RVOL)", 0.0, 5.0, 1.2, 0.1, help="حجم تداول أعلى من المتوسط بـ N مرة")
 
 # ==========================================
-# إنشاء جلسة اتصال متجاوزة للحظر لـ yfinance
+# دالة فحص وحساب الخصائص لكل أصل (بدون تخزين مؤقت يسبب أخطاء)
 # ==========================================
-def get_custom_session():
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    })
-    return session
-
-# ==========================================
-# دالة فحص وحساب الخصائص لكل أصل
-# ==========================================
-@st.cache_data(ttl=1800)
 def scan_ticker(ticker, period, interval):
     try:
-        session = get_custom_session()
-        df = yf.download(ticker, period=period, interval=interval, session=session, progress=False, auto_adjust=True)
+        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
         
         if isinstance(df.columns, pd.MultiIndex):
             df = df.xs(ticker, axis=1, level=1)
@@ -82,7 +69,7 @@ def scan_ticker(ticker, period, interval):
             'Close_Position_%': float(prev['Close_Position_%']),
             'Relative_Volume': float(prev['Relative_Volume'])
         }
-    except Exception as e:
+    except Exception:
         return None
 
 # ==========================================
@@ -141,4 +128,4 @@ if st.button("🚀 تشغيل رادار الفحص الشامل", type="primary
                 'Relative_Volume': "{:.2f}x"
             }), use_container_width=True)
     else:
-        st.error("تعذر جلب البيانات. تأكد من اتصال الإنترنت وصحة رموز الأصول (بعض الشبكات أو المزودين يحظرون اتصالات واجهات برمجة التطبيقات المالية مباشرة).")
+        st.error("تعذر جلب البيانات. تأكد من اتصال الإنترنت وصحة رموز الأصول.")

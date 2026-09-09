@@ -2,3 +2,8 @@ streamlit
 numpy
 pandas
 yfinance
+time
+re
+
+datetime 
+datetime

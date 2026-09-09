@@ -1,8 +1,8 @@
 time
 re
 urllib.request
-streamlit as st
-numpy as np
-pandas as pd
-yfinance as yf
+streamlit
+numpy
+pandas
+yfinance
 datetime

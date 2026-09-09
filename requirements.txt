@@ -4,6 +4,6 @@ pandas
 yfinance
 time
 re
-
+urllib.request
 datetime 
 datetime

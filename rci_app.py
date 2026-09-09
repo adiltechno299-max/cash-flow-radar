@@ -1,6 +1,8 @@
 """
 Cash Flow + Liquidity + Momentum Radar — Streamlit Web App
 رادار التدفق النقدي والسيولة والزخم (متوافق مع الهواتف)
+--- نسخة: فرص الشراء (BUY) فقط، تم تجاهل إشارات البيع (SELL) ---
+--- تم إضافة فلتر القيمة السوقية: تجاهل الشركات الصغيرة (أقل من الحد المحدد) ---
 """
 
 import time
@@ -21,6 +23,8 @@ OBV_SLOPE_LEN      = 5    # قياس تسارع الزخم في آخر الشم�
 
 CHUNK_SIZE = 50  
 CACHE_TTL  = 60
+
+DEFAULT_MIN_MARKET_CAP_B = 1.0   # الحد الأدنى الافتراضي للقيمة السوقية بالمليار دولار
 
 # ═══════════════════════════════════════════════
 #  جلب رموز NASDAQ 
@@ -119,6 +123,25 @@ def download_raw_batch(tickers: tuple, yf_interval: str, yf_period: str, status_
     return result
 
 # ═══════════════════════════════════════════════
+#  MARKET CAP FILTER (تجاهل الشركات الصغيرة)
+# ═══════════════════════════════════════════════
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_market_cap(ticker: str):
+    """
+    يجلب القيمة السوقية للسهم. يُستدعى فقط للأسهم التي اجتازت
+    فلاتر السعر/السيولة/الإشارة لتقليل عدد طلبات الشبكة.
+    يُرجع None إذا تعذر الجلب (وفي هذه الحالة يتم استبعاد السهم احتياطياً).
+    """
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        cap = fi.get("market_cap") if isinstance(fi, dict) else getattr(fi, "market_cap", None)
+        if cap is None or cap <= 0:
+            return None
+        return float(cap)
+    except Exception:
+        return None
+
+# ═══════════════════════════════════════════════
 #  INDICATORS & CHAIKIN MONEY FLOW (CMF)
 # ═══════════════════════════════════════════════
 def _rolling_sum(arr, period):
@@ -148,7 +171,12 @@ def calculate_cmf(high, low, close, vol, period=14):
             cmf[i] = sub_mf / (sub_vol + 1e-10)
     return cmf
 
-def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg):
+def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_cap=0.0):
+    """
+    ملاحظة: تم تعديل هذه الدالة لترصد فرص الشراء (BUY) فقط.
+    أي إشارة بيع (Composite سالب) يتم تجاهلها تماماً ولا تُرجع كنتيجة.
+    كما يتم تجاهل الشركات ذات القيمة السوقية الأقل من min_market_cap (بالدولار).
+    """
     try:
         if df is None or len(df) < 35: return None
         
@@ -204,13 +232,27 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg):
             (0.25 * score_momentum)
         )
 
-        sig = None
-        if composite >= score_min: sig = "BUY (CASH FLOW+)"
-        elif composite <= -score_min: sig = "SELL (OUTFLOW)"
-        if sig is None: return None
+        # ══════════════════════════════════════════════════════
+        # فقط إشارات الشراء (BUY): يتم تجاهل أي شيء غير ذلك بالكامل
+        # ══════════════════════════════════════════════════════
+        if composite < score_min:
+            return None
+        sig = "BUY (CASH FLOW+)"
+
+        # ══════════════════════════════════════════════════════
+        # فلتر القيمة السوقية: تجاهل الشركات الصغيرة (Small Caps)
+        # يتم الفحص هنا فقط (بعد اجتياز باقي الشروط) لتقليل عدد
+        # الطلبات الإضافية للشبكة على yfinance.
+        # ══════════════════════════════════════════════════════
+        mcap = None
+        if min_market_cap > 0:
+            mcap = get_market_cap(ticker)
+            if mcap is None or mcap < min_market_cap:
+                return None
 
         # ══════════════════════════════════════════════════════════════
         # منطق الـ SL و TP المبني على "تمركز السيولة" (Liquidity Pools)
+        # -- تم الإبقاء على منطق الشراء فقط --
         # ══════════════════════════════════════════════════════════════
         tpv = tp_price * vol
         r_tpv = _rolling_sum(tpv, 14)
@@ -224,20 +266,16 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg):
         tr = max(high[i]-low[i], abs(high[i]-close[i-1]), abs(low[i]-close[i-1]))
         buffer = tr * 0.2  
 
-        if "BUY" in sig:
-            sl = min(ssl_pool, vwap) - buffer if price > vwap else ssl_pool - buffer
-            risk = price - sl
-            tp = bsl_pool if (bsl_pool - price) > (risk * 1.0) else price + (risk * 2.0)
-        else:
-            sl = max(bsl_pool, vwap) + buffer if price < vwap else bsl_pool + buffer
-            risk = sl - price
-            tp = ssl_pool if (price - ssl_pool) > (risk * 1.0) else price - (risk * 2.0)
+        sl = min(ssl_pool, vwap) - buffer if price > vwap else ssl_pool - buffer
+        risk = price - sl
+        tp = bsl_pool if (bsl_pool - price) > (risk * 1.0) else price + (risk * 2.0)
 
         return dict(
             Ticker=ticker, Signal=sig, Price=round(price, 2),
             CF=round(score_cash_flow, 2), LQ=round(score_liquidity, 2), MO=round(score_momentum, 2),
             RVOL=round(rvol, 2), CMF=round(cmf_val, 2),
             TP=round(tp, 2), SL=round(sl, 2),
+            MarketCapB=round(mcap / 1e9, 2) if mcap else None,
             Score=round(composite, 3), _score=composite
         )
     except:
@@ -252,16 +290,14 @@ st.markdown("""
 <style>
 .stButton > button { height: 3rem !important; font-size: 1.1rem !important; font-weight: 700 !important; border-radius: 8px !important; }
 .card-buy { background: linear-gradient(135deg,#0a2e12,#11471d); border-left: 5px solid #00e676; border-radius: 8px; padding: 12px; margin: 8px 0; color: #e0ffe0; }
-.card-sell { background: linear-gradient(135deg,#2e0a0a,#471111); border-left: 5px solid #ff5252; border-radius: 8px; padding: 12px; margin: 8px 0; color: #ffe0e0; }
 .tag-buy  { background:#00e676; color:#000; border-radius:4px; padding:2px 8px; font-weight:bold; font-size:0.8rem; }
-.tag-sell { background:#ff5252; color:#fff; border-radius:4px; padding:2px 8px; font-weight:bold; font-size:0.8rem; }
 .metric-pill { background:#1e3a5f; color:#7dd3fc; border-radius:4px; padding:2px 6px; font-size:0.8rem; margin-right:5px;}
 .score-high { color: #00e676; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🌊 Cash Flow + Liquidity + Momentum Radar")
-st.caption("Advanced Institutional Flow & Liquidity Engine (CMF + RVOL + Order Flow)")
+st.caption("Advanced Institutional Flow & Liquidity Engine (CMF + RVOL + Order Flow) — إشارات الشراء فقط")
 st.divider()
 
 with st.spinner("📡 جلب القائمة الأساسية..."):
@@ -279,12 +315,20 @@ with st.expander("⚙️ إعدادات الرادار الثلاثي", expanded
         min_price = st.number_input("💵 الحد الأدنى للسعر ($)", value=5.0, step=1.0)
         min_vol_avg = st.number_input("💧 أدنى سيولة متوسطة", value=5000, step=1000)
 
+    min_market_cap_b = st.number_input(
+        "🏢 الحد الأدنى للقيمة السوقية (مليار $)",
+        value=DEFAULT_MIN_MARKET_CAP_B, step=0.5, min_value=0.0,
+        help="يتم تجاهل أي شركة أقل من هذه القيمة السوقية (ضع 0 لتعطيل الفلتر)."
+    )
+    min_market_cap = min_market_cap_b * 1_000_000_000
+
     search_input = st.text_input("🔑 إضافة أسهم مخصصة (مفصولة بفاصلة)", placeholder="مثال: AAPL, TSLA, NVDA")
 
 custom_tickers = [x.strip().upper() for x in re.split(r'[,\s]+', search_input) if x.strip()]
 scan_list = list(dict.fromkeys(custom_tickers + nasdaq_all[:max_stocks]))
 
-st.info(f"سيتم فحص **{len(scan_list)}** سهم على فريم **{tf}**.")
+mcap_note = f"وتجاهل الشركات أقل من **{min_market_cap_b:g} مليار $**" if min_market_cap > 0 else "بدون فلتر قيمة سوقية"
+st.info(f"سيتم فحص **{len(scan_list)}** سهم على فريم **{tf}** — عرض فرص **الشراء فقط** {mcap_note}.")
 if max_stocks >= 1000:
     st.caption("⚠️ مسح عدد كبير من الأسهم قد يستغرق وقتاً أطول بسبب حدود طلبات Yahoo Finance.")
 
@@ -307,7 +351,7 @@ if st.button("🔍 SCAN MARKET NOW", type="primary", use_container_width=True):
         )
         
         for ticker, df in raw_data.items():
-            sig = get_radar_signal(ticker, df, score_min, min_price, min_vol_avg)
+            sig = get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_cap)
             if sig:
                 results.append(sig)
                 
@@ -316,20 +360,17 @@ if st.button("🔍 SCAN MARKET NOW", type="primary", use_container_width=True):
     status_text.empty()
     bar.empty()
     
-    results = sorted(results, key=lambda x: abs(x["_score"]), reverse=True)
+    results = sorted(results, key=lambda x: x["_score"], reverse=True)
     
-    st.success(f"✅ اكتمل المسح في {time.time()-start_time:.1f} ثانية. تم رصد {len(results)} فرصة.")
+    st.success(f"✅ اكتمل المسح في {time.time()-start_time:.1f} ثانية. تم رصد {len(results)} فرصة شراء.")
     
     for r in results:
-        is_buy = "BUY" in r['Signal']
-        card_class = "card-buy" if is_buy else "card-sell"
-        tag_class = "tag-buy" if is_buy else "tag-sell"
-        
+        mcap_pill = f'<span class="metric-pill">Market Cap: ${r["MarketCapB"]}B</span>' if r.get("MarketCapB") else ""
         html = f"""
-        <div class="{card_class}">
+        <div class="card-buy">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
                 <span style="font-size:1.3rem; font-weight:bold; letter-spacing:1px;">{r['Ticker']}</span>
-                <span class="{tag_class}">{r['Signal']}</span>
+                <span class="tag-buy">{r['Signal']}</span>
             </div>
             <div style="font-size:0.95rem; margin-bottom:8px;">
                 💵 Price: <b>${r['Price']}</b> &nbsp;|&nbsp; 
@@ -341,6 +382,7 @@ if st.button("🔍 SCAN MARKET NOW", type="primary", use_container_width=True):
                 <span class="metric-pill">Liquidity (LQ): {r['LQ']}</span>
                 <span class="metric-pill">Momentum (MO): {r['MO']}</span>
                 <span class="metric-pill">CMF: {r['CMF']}</span>
+                {mcap_pill}
                 <span class="metric-pill">Score: <span class="score-high">{r['Score']}</span></span>
             </div>
         </div>
@@ -348,4 +390,4 @@ if st.button("🔍 SCAN MARKET NOW", type="primary", use_container_width=True):
         st.markdown(html, unsafe_allow_html=True)
         
     if not results:
-        st.warning("لم يتم اكتشاف أي فرص تتطابق مع معايير التدفق النقدي الحالية. جرّب خفض (Score Limit).")
+        st.warning("لم يتم اكتشاف أي فرص شراء تتطابق مع معايير التدفق النقدي الحالية. جرّب خفض (Score Limit).")

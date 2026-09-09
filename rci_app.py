@@ -18,8 +18,14 @@ from datetime import datetime
 #  DEFAULT PARAMETERS
 # ═══════════════════════════════════════════════
 CMF_PERIOD         = 14   # فترة تدفق الأموال (Chaikin Money Flow)
-RVOL_LOOKBACK      = 20   # متوسط الحجم للمقارنة
+MFI_PERIOD         = 14   # فترة مؤشر التدفق النقدي القياسي (Money Flow Index)
+RVOL_LOOKBACK      = 20   # متوسط الحجم للمقارنة (لا يشمل الشمعة الحالية)
 OBV_SLOPE_LEN      = 5    # قياس تسارع الزخم في آخر الشموع
+VOL_NORM_LOOKBACK  = 20   # نافذة حساب التذبذب (volatility) لتطبيع OBV والزخم إحصائياً
+SWING_LEFT         = 2    # عدد الشموع على يسار القمة/القاع لتأكيده كـ Swing Point
+SWING_RIGHT        = 2    # عدد الشموع على يمين القمة/القاع لتأكيده (لا يمكن تأكيد قمة قبل مرور هذا العدد)
+LIQUIDITY_LOOKBACK = 50   # مدى البحث للخلف عن آخر تجمع سيولة (Swing) لم يتم "امتصاصه" بعد
+MIN_RISK_REWARD    = 1.2  # أدنى نسبة عائد/مخاطرة مقبولة لقبول الصفقة
 
 CHUNK_SIZE = 50  
 CACHE_TTL  = 60
@@ -190,9 +196,89 @@ def calculate_cmf(high, low, close, vol, period=14):
             cmf[i] = sub_mf / (sub_vol + 1e-10)
     return cmf
 
+def calculate_mfi(high, low, close, vol, period=14):
+    """
+    تطبيق قياسي لمؤشر Money Flow Index (MFI):
+    1) Typical Price = (H+L+C)/3
+    2) Raw Money Flow = Typical Price * Volume
+    3) مقارنة TP الحالي بالسابق لتصنيف التدفق كموجب أو سالب
+    4) Money Ratio = مجموع التدفق الموجب / مجموع التدفق السالب على مدى "period"
+    5) MFI = 100 - 100/(1+Money Ratio)
+    محسوبة بشكل متجه (vectorized) عبر نافذة متحركة حقيقية بدل عدد ثابت من الشموع.
+    """
+    n = len(close)
+    tp = (high + low + close) / 3.0
+    raw_mf = tp * vol
+
+    tp_diff = tp[1:] - tp[:-1]
+    pos_mf = np.where(tp_diff > 0, raw_mf[1:], 0.0)
+    neg_mf = np.where(tp_diff < 0, raw_mf[1:], 0.0)
+
+    # محاذاة الطول الأصلي (n) بإضافة صفر في البداية (لا يوجد تدفق قبل أول شمعة)
+    pos_full = np.concatenate(([0.0], pos_mf))
+    neg_full = np.concatenate(([0.0], neg_mf))
+
+    pos_sum = _rolling_sum(pos_full, period)
+    neg_sum = _rolling_sum(neg_full, period)
+
+    mfi = np.full(n, 50.0)  # قيمة محايدة افتراضية عند نقص البيانات (أول period-1 شمعة)
+    valid = ~np.isnan(pos_sum) & ~np.isnan(neg_sum)
+    if valid.any():
+        p, ng = pos_sum[valid], neg_sum[valid]
+        mfi[valid] = np.where(ng <= 1e-10, 100.0, 100.0 - (100.0 / (1.0 + p / (ng + 1e-10))))
+    return mfi
+
+def find_swing_points(high, low, left=2, right=2):
+    """
+    يحدد Swing High / Swing Low حقيقيين (Fractals): قمة أعلى من "left" شموع
+    قبلها و"right" شموع بعدها، وقاع أدنى من محيطه بنفس الطريقة.
+    لا يمكن تأكيد أي Swing إلا بعد مرور "right" شموع عليه (كما يحدث فعلياً في التداول).
+    """
+    n = len(high)
+    swing_high = np.zeros(n, dtype=bool)
+    swing_low = np.zeros(n, dtype=bool)
+    for k in range(left, n - right):
+        window_h = high[k - left : k + right + 1]
+        window_l = low[k - left : k + right + 1]
+        if high[k] == window_h.max() and np.argmax(window_h) == left:
+            swing_high[k] = True
+        if low[k] == window_l.min() and np.argmin(window_l) == left:
+            swing_low[k] = True
+    return swing_high, swing_low
+
+def find_liquidity_pools(high, low, swing_high, swing_low, i, lookback=50):
+    """
+    يبحث للخلف عن أقرب Swing High/Low لم يتم "امتصاصه" بعد (Unmitigated):
+    أي أن السعر لم يتجاوزه منذ تشكّله وحتى الشمعة الحالية.
+    هذا هو التعريف الفعلي لـ "تجمّع السيولة" (Liquidity Pool) — مستوى ينتظر فيه
+    أمر إيقاف/دخول كثيف لم يتم تفعيله بعد. إن لم يُعثر على أي منها ضمن النطاق،
+    يتم الرجوع لأعلى/أدنى سعر في النطاق كحل احتياطي (fallback) فقط.
+    """
+    start = max(0, i - lookback)
+    bsl = None
+    for k in range(i - 1, start - 1, -1):
+        if swing_high[k]:
+            level = high[k]
+            if not np.any(high[k + 1 : i] > level):
+                bsl = level
+                break
+    ssl = None
+    for k in range(i - 1, start - 1, -1):
+        if swing_low[k]:
+            level = low[k]
+            if not np.any(low[k + 1 : i] < level):
+                ssl = level
+                break
+    # fallback احتياطي فقط إن لم يُعثر على Swing غير ممسوح ضمن النطاق
+    if bsl is None:
+        bsl = np.max(high[start:i]) if i > start else high[i]
+    if ssl is None:
+        ssl = np.min(low[start:i]) if i > start else low[i]
+    return bsl, ssl
+
 def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_cap=0.0):
     """
-    ملاحظة: تم تعديل هذه الدالة لترصد فرص الشراء (BUY) فقط.
+    ملاحظة: ترصد هذه الدالة فرص الشراء (BUY) فقط.
     أي إشارة بيع (Composite سالب) يتم تجاهلها تماماً ولا تُرجع كنتيجة.
     كما يتم تجاهل الشركات ذات القيمة السوقية الأقل من min_market_cap (بالدولار).
     """
@@ -205,28 +291,27 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
         vol   = np.maximum(df["Volume"].values.astype(float), 0.0)
         
         price = close[-1]
-        
-        # فلتر السعر والسيولة
-        if price < min_price: return None
-        avg_vol = vol[-RVOL_LOOKBACK:].mean()
-        if avg_vol < min_vol_avg: return None
-
         i = len(close) - 1
         
+        # ══════════════════════════════════════════════════════
+        # فلتر السعر والسيولة — RVOL/متوسط الحجم يُحسب من الشموع
+        # السابقة فقط، بدون تضمين الشمعة الحالية (تفادي تحيّز النظر
+        # للأمام / self-reference).
+        # ══════════════════════════════════════════════════════
+        if price < min_price: return None
+        prior_window = vol[max(0, i - RVOL_LOOKBACK):i]  # يستبعد الشمعة i نفسها
+        avg_vol = prior_window.mean() if len(prior_window) > 0 else vol[i]
+        if avg_vol < min_vol_avg: return None
+
         # 1. CASH FLOW (التدفق النقدي المؤسساتي - CMF & MFI) - [الوزن: 40%]
         cmf_arr = calculate_cmf(high, low, close, vol, CMF_PERIOD)
         cmf_val = cmf_arr[i]
-        
-        tp_price = (high + low + close) / 3.0
-        mf = tp_price * vol
-        pos = np.where(tp_price[1:] > tp_price[:-1], mf[1:], 0)
-        neg = np.where(tp_price[1:] < tp_price[:-1], mf[1:], 0)
-        rp = np.sum(pos[-10:])
-        rn = np.sum(neg[-10:])
-        mfi = 100.0 if rn < 1e-10 else 100.0 - (100.0 / (1.0 + rp / rn))
-        
+
+        mfi_arr = calculate_mfi(high, low, close, vol, MFI_PERIOD)
+        mfi_val = mfi_arr[i]
+
         s_cf_cmf = np.clip(cmf_val / 0.15, -1.0, 1.0)
-        s_cf_mfi = np.clip((mfi - 50) / 30.0, -1.0, 1.0)
+        s_cf_mfi = np.clip((mfi_val - 50) / 30.0, -1.0, 1.0)
         score_cash_flow = (s_cf_cmf * 0.6) + (s_cf_mfi * 0.4)
 
         # 2. LIQUIDITY (السيولة اللحظية وانفجار الحجم - RVOL) - [الوزن: 35%]
@@ -234,15 +319,42 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
         score_liquidity = np.clip((rvol - 0.7) / 2.0, -0.5, 1.0)
         if rvol < 0.4: score_liquidity = -1.0
 
+        # ══════════════════════════════════════════════════════
         # 3. MOMENTUM (الزخم والتسارع - OBV & Price ROC) - [الوزن: 25%]
+        # بدل الثوابت اليدوية (25x, 5x)، يتم تطبيع كل من تغيّر السعر
+        # وتغيّر OBV إحصائياً (z-score) بالنسبة لتذبذبهما الطبيعي على
+        # مدى VOL_NORM_LOOKBACK شمعة، ثم ضغط الناتج إلى [-1, 1].
+        # ══════════════════════════════════════════════════════
         d = np.sign(np.diff(close))
         obv = np.empty(len(close))
         obv[0] = vol[0]
         for j in range(1, len(close)): obv[j] = obv[j - 1] + d[j - 1] * vol[j]
-        obv_roc = (obv[i] - obv[i - OBV_SLOPE_LEN]) / (abs(obv[i - OBV_SLOPE_LEN]) + 1.0)
-        prc_roc = (close[i] - close[i - OBV_SLOPE_LEN]) / (close[i - OBV_SLOPE_LEN] + 1e-10)
-        
-        score_momentum = np.clip((prc_roc * 25) + (obv_roc * 5), -1.0, 1.0)
+        obv_step = np.diff(obv)  # obv_step[k] = obv[k+1]-obv[k]
+
+        # --- تطبيع تغيّر OBV إحصائياً ---
+        obv_change = obv[i] - obv[i - OBV_SLOPE_LEN]
+        recent_obv_steps = obv_step[max(0, i - VOL_NORM_LOOKBACK):i]
+        obv_std = recent_obv_steps.std() if len(recent_obv_steps) >= 5 else np.nan
+        if not np.isfinite(obv_std) or obv_std < 1e-9:
+            obv_z_score = 0.0
+        else:
+            expected_obv_dispersion = obv_std * np.sqrt(OBV_SLOPE_LEN)
+            obv_z_score = obv_change / (expected_obv_dispersion + 1e-10)
+        score_obv = np.clip(obv_z_score / 3.0, -1.0, 1.0)  # ±3 انحراف معياري يغطي تقريباً المدى الكامل
+
+        # --- تطبيع تغيّر السعر إحصائياً (نسبة إلى تذبذبه التاريخي) ---
+        returns = np.diff(close) / close[:-1]
+        prc_change = (close[i] - close[i - OBV_SLOPE_LEN]) / (close[i - OBV_SLOPE_LEN] + 1e-10)
+        recent_returns = returns[max(0, i - VOL_NORM_LOOKBACK):i]
+        ret_std = recent_returns.std() if len(recent_returns) >= 5 else np.nan
+        if not np.isfinite(ret_std) or ret_std < 1e-9:
+            prc_z_score = 0.0
+        else:
+            expected_price_dispersion = ret_std * np.sqrt(OBV_SLOPE_LEN)
+            prc_z_score = prc_change / (expected_price_dispersion + 1e-10)
+        score_price = np.clip(prc_z_score / 3.0, -1.0, 1.0)
+
+        score_momentum = np.clip((score_price * 0.7) + (score_obv * 0.3), -1.0, 1.0)
 
         # ---- WEIGHTED EVIDENCE MODEL ----
         composite = float(
@@ -270,30 +382,52 @@ def get_radar_signal(ticker, df, score_min, min_price, min_vol_avg, min_market_c
                 return None
 
         # ══════════════════════════════════════════════════════════════
-        # منطق الـ SL و TP المبني على "تمركز السيولة" (Liquidity Pools)
-        # -- تم الإبقاء على منطق الشراء فقط --
+        # منطق الـ SL و TP المبني على "تمركز السيولة" (Liquidity Pools) الحقيقية:
+        # نبحث عن أقرب Swing High/Low لم يُمتَص بعد (unmitigated) بدل مجرد
+        # أعلى/أدنى سعر في نافذة قصيرة.
         # ══════════════════════════════════════════════════════════════
+        tp_price = (high + low + close) / 3.0
         tpv = tp_price * vol
         r_tpv = _rolling_sum(tpv, 14)
         r_vol = _rolling_sum(vol, 14)
         vwap = r_tpv[i] / (r_vol[i] + 1e-10)
 
-        liq_lookback = 15
-        bsl_pool = np.max(high[max(0, i - liq_lookback):i]) # Buy-Side Liquidity
-        ssl_pool = np.min(low[max(0, i - liq_lookback):i])  # Sell-Side Liquidity
-        
-        tr = max(high[i]-low[i], abs(high[i]-close[i-1]), abs(low[i]-close[i-1]))
-        buffer = tr * 0.2  
+        swing_high, swing_low = find_swing_points(high, low, SWING_LEFT, SWING_RIGHT)
+        bsl_pool, ssl_pool = find_liquidity_pools(high, low, swing_high, swing_low, i, LIQUIDITY_LOOKBACK)
 
-        sl = min(ssl_pool, vwap) - buffer if price > vwap else ssl_pool - buffer
+        tr = max(high[i]-low[i], abs(high[i]-close[i-1]), abs(low[i]-close[i-1]))
+        buffer = tr * 0.2 if np.isfinite(tr) and tr > 0 else price * 0.002
+
+        sl = (min(ssl_pool, vwap) - buffer) if price > vwap else (ssl_pool - buffer)
         risk = price - sl
         tp = bsl_pool if (bsl_pool - price) > (risk * 1.0) else price + (risk * 2.0)
+
+        # ══════════════════════════════════════════════════════════════
+        # التحقق (Validation) من صلاحية TP/SL قبل قبول الإشارة:
+        # - يجب أن تكون كل القيم رقمية صالحة (finite)
+        # - المخاطرة (risk) والعائد (reward) يجب أن يكونا موجبين فعلياً
+        # - فرض حد أدنى لنسبة العائد/المخاطرة (Risk:Reward)، وإن لم يتحقق
+        #   يتم تمديد TP لتحقيق الحد الأدنى بدل رفض إشارة جيدة الأساس
+        # ══════════════════════════════════════════════════════════════
+        if not all(np.isfinite(v) for v in (sl, tp, risk, price)):
+            return None
+        if risk <= 0:               # SL غير منطقي (فوق أو يساوي السعر الحالي)
+            return None
+        reward = tp - price
+        if reward <= 0:              # TP غير منطقي (تحت السعر الحالي)
+            return None
+
+        rr = reward / risk
+        if rr < MIN_RISK_REWARD:
+            tp = price + (risk * MIN_RISK_REWARD)
+            reward = tp - price
+            rr = reward / risk
 
         return dict(
             Ticker=ticker, Signal=sig, Price=round(price, 2),
             CF=round(score_cash_flow, 2), LQ=round(score_liquidity, 2), MO=round(score_momentum, 2),
-            RVOL=round(rvol, 2), CMF=round(cmf_val, 2),
-            TP=round(tp, 2), SL=round(sl, 2),
+            RVOL=round(rvol, 2), CMF=round(cmf_val, 2), MFI=round(mfi_val, 1),
+            TP=round(tp, 2), SL=round(sl, 2), RR=round(rr, 2),
             MarketCapB=round(mcap / 1e9, 2) if mcap else None,
             Score=round(composite, 3), _score=composite
         )
@@ -395,13 +529,15 @@ if st.button("🔍 SCAN MARKET NOW", type="primary", use_container_width=True):
             <div style="font-size:0.95rem; margin-bottom:8px;">
                 💵 Price: <b>${r['Price']}</b> &nbsp;|&nbsp; 
                 🎯 TP: <b style="color:#00e676">${r['TP']}</b> &nbsp;|&nbsp; 
-                🛡️ SL: <b style="color:#ff5252">${r['SL']}</b>
+                🛡️ SL: <b style="color:#ff5252">${r['SL']}</b> &nbsp;|&nbsp;
+                ⚖️ R:R <b>{r['RR']}</b>
             </div>
             <div>
                 <span class="metric-pill">CashFlow (CF): {r['CF']}</span>
                 <span class="metric-pill">Liquidity (LQ): {r['LQ']}</span>
                 <span class="metric-pill">Momentum (MO): {r['MO']}</span>
                 <span class="metric-pill">CMF: {r['CMF']}</span>
+                <span class="metric-pill">MFI: {r['MFI']}</span>
                 {mcap_pill}
                 <span class="metric-pill">Score: <span class="score-high">{r['Score']}</span></span>
             </div>
